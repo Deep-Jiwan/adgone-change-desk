@@ -45,6 +45,11 @@ npm run db:migrate:remote
 npm run deploy
 ```
 
+The Worker is served at **https://changedesk.adgone.co.tz** (configured in `wrangler.toml`). This needs the `adgone.co.tz` zone to be on the
+same Cloudflare account; Cloudflare then creates the DNS record and certificate on the first deploy. If the zone lives elsewhere, delete the
+`routes` line in `wrangler.toml` to use the free `*.workers.dev` address instead, or move the domain's nameservers to Cloudflare.
+If you use GitHub OAuth, set its callback URL to `https://changedesk.adgone.co.tz/api/github/oauth/callback`.
+
 Open the deployed URL. **The first account created becomes the admin.** Then add apps (Dashboard → *Add app*) and invite your
 team (*Team* → *Invite a teammate*). Invited people get a one-time temporary password you pass on to them; they must change it
 on first sign-in.

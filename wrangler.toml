@@ -2,6 +2,10 @@ name = "change-desk"
 main = "src/index.js"
 compatibility_date = "2025-01-01"
 
+# Custom domain. The adgone.co.tz zone must be on the same Cloudflare account: on deploy Cloudflare
+# creates the DNS record and TLS certificate for this hostname automatically.
+routes = [{ pattern = "changedesk.adgone.co.tz", custom_domain = true }]
+
 # Static frontend. API requests (/api/*) go to the Worker first.
 [assets]
 directory = "./public"
