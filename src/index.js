@@ -1,13 +1,17 @@
 import {
-  assertNotThrottled, checkNewPassword, clearFailures, createSession, currentUser, destroySession,
+  assertNotThrottled, checkNewPassword, clearFailures, cookieValue, createSession, currentUser, destroySession,
   hashPassword, purgeExpired, recordFailure, sessionCookie, sessionToken, verifyPassword,
 } from './auth.js';
+import {
+  addConnection, commentText, githubEnabled, handleWebhook, labelDiff, linkApp, oauthEnabled, parseRepo,
+  requireEnabled, statusText, syncIssue, unlinkApp, webBase, webhookSecret, webhookUrl,
+} from './github.js';
 import {
   CATEGORIES, DEFAULT_PROGRESS, PRIORITIES, ROLES, STATUSES, allowedTransitions, canEditDetails,
   canTransition, isStaff, noteRequired,
 } from './workflow.js';
 import {
-  HttpError, csvCell, httpUrlOrEmpty, json, oneOf, optionalDate, randomToken, readJson, sha256Hex, str, tempPassword,
+  HttpError, all, csvCell, first, httpUrlOrEmpty, json, oneOf, optionalDate, randomToken, readJson, run, sha256Hex, str, tempPassword,
 } from './util.js';
 
 const CSRF_HEADER = 'change-desk';
@@ -27,17 +31,15 @@ const OVERDUE = `(r.due_date IS NOT NULL AND r.due_date < date('now') AND r.stat
 const REQUEST_SELECT = `
   SELECT r.id, r.app_id, r.seq, ${REF} AS ref, r.title, r.description, r.category, r.priority, r.status,
          r.progress, r.requester_id, r.assignee_id, r.due_date, r.completed_at, r.created_at, r.updated_at,
+         r.github_repo, r.github_issue_number, r.github_issue_url, r.github_error,
          ${OVERDUE} AS overdue,
-         a.name AS app_name, a.icon AS app_icon, a.key AS app_key,
+         a.name AS app_name, a.icon AS app_icon, a.key AS app_key, a.github_repo AS app_github_repo,
          ru.name AS requester_name, au.name AS assignee_name
     FROM requests r
     JOIN apps a ON a.id = r.app_id
     JOIN users ru ON ru.id = r.requester_id
     LEFT JOIN users au ON au.id = r.assignee_id`;
 
-const first = (env, sql, ...args) => env.DB.prepare(sql).bind(...args).first();
-const all = async (env, sql, ...args) => (await env.DB.prepare(sql).bind(...args).all()).results;
-const run = (env, sql, ...args) => env.DB.prepare(sql).bind(...args).run();
 
 const logActivity = (env, requestId, userId, action, detail = '') =>
   run(env, 'INSERT INTO activity (request_id, user_id, action, detail) VALUES (?, ?, ?, ?)', requestId, userId, action, detail);
@@ -56,10 +58,10 @@ const publicUser = (u) => ({ id: u.id, email: u.email, name: u.name, role: u.rol
 
 // ---------------------------------------------------------------- routes
 
-const routes = []; // [method, regex, handler, {auth}]
-function route(method, pattern, handler, { auth = true } = {}) {
+const routes = []; // [method, regex, handler, auth, csrf]
+function route(method, pattern, handler, { auth = true, csrf = true } = {}) {
   const regex = new RegExp('^' + pattern.replace(/:(\w+)/g, '(?<$1>[^/]+)') + '$');
-  routes.push([method, regex, handler, auth]);
+  routes.push([method, regex, handler, auth, csrf]);
 }
 
 // ---- auth / session
@@ -281,7 +283,7 @@ route('GET', '/api/export.csv', async ({ env, url, user }) => {
   });
 });
 
-route('POST', '/api/requests', async ({ env, request, user }) => {
+route('POST', '/api/requests', async ({ env, request, user, url }) => {
   const body = await readJson(request);
   const appId = idParam(body.app_id);
   const title = str(body.title, 'Title', { min: 3, max: 150 });
@@ -297,8 +299,9 @@ route('POST', '/api/requests', async ({ env, request, user }) => {
     appId, taken.seq, title, description, category, priority, user.id);
   const id = res.meta.last_row_id;
   await logActivity(env, id, user.id, 'created');
+  await syncIssue(env, id, url.origin, { create: true }); // best-effort; never fails the request
   const created = await first(env, `${REQUEST_SELECT} WHERE r.id = ?`, id);
-  return json({ id, ref: created.ref }, 201);
+  return json({ id, ref: created.ref, github_issue_url: created.github_issue_url }, 201);
 });
 
 async function loadRequest(env, id) {
@@ -313,11 +316,12 @@ route('GET', '/api/requests/:id', async ({ env, user, params }) => {
   const [attachments, comments, activity] = await Promise.all([
     all(env, `SELECT t.id, t.name, t.content_type, t.size, t.created_at, u.name AS uploader_name
                 FROM attachments t JOIN users u ON u.id = t.uploader_id WHERE t.request_id = ? ORDER BY t.id`, id),
-    all(env, `SELECT c.id, c.body, c.created_at, c.user_id, u.name AS user_name, u.role AS user_role
-                FROM comments c JOIN users u ON u.id = c.user_id WHERE c.request_id = ? ORDER BY c.id`, id),
+    all(env, `SELECT c.id, c.body, c.created_at, c.user_id, c.source, COALESCE(u.name, c.external_author) AS user_name, u.role AS user_role
+                FROM comments c LEFT JOIN users u ON u.id = c.user_id WHERE c.request_id = ? ORDER BY c.id`, id),
     all(env, `SELECT x.id, x.action, x.detail, x.created_at, u.name AS user_name
                 FROM activity x LEFT JOIN users u ON u.id = x.user_id WHERE x.request_id = ? ORDER BY x.id DESC`, id),
   ]);
+  if (!isStaff(user)) request.github_error = request.github_error ? 'Not synced to GitHub yet' : null;
   return json({
     request,
     attachments: attachments.map((a) => ({ ...a, inline: INLINE_TYPES.has(a.content_type) })),
@@ -334,7 +338,7 @@ route('GET', '/api/requests/:id', async ({ env, user, params }) => {
 
 const label = (s) => s.replace('_', ' ');
 
-route('PATCH', '/api/requests/:id', async ({ env, request, user, params }) => {
+route('PATCH', '/api/requests/:id', async ({ env, request, user, params, url }) => {
   const id = idParam(params.id);
   const body = await readJson(request);
   const current = await loadRequest(env, id);
@@ -398,20 +402,30 @@ route('PATCH', '/api/requests/:id', async ({ env, request, user, params }) => {
   await run(env, `UPDATE requests SET ${cols}, updated_at = datetime('now') WHERE id = ?`, ...changes.map(([, v]) => v), id);
   for (const [action, detail] of log) await logActivity(env, id, user.id, action, detail);
   if (note) await run(env, 'INSERT INTO comments (request_id, user_id, body) VALUES (?, ?, ?)', id, user.id, note);
+  if (current.github_issue_number) {
+    const next = Object.fromEntries(changes);
+    const statusChanged = next.status && next.status !== current.status;
+    await syncIssue(env, id, url.origin, {
+      state: Boolean(statusChanged),
+      labels: labelDiff(current, next),
+      comment: statusChanged ? { text: statusText(user.name, current.status, next.status, note) } : null,
+    });
+  }
   return json({ ok: true, changed: true });
 });
 
-route('POST', '/api/requests/:id/comments', async ({ env, request, user, params }) => {
+route('POST', '/api/requests/:id/comments', async ({ env, request, user, params, url }) => {
   const id = idParam(params.id);
   await loadRequest(env, id);
   const body = str((await readJson(request)).body, 'Comment', { min: 1, max: 5000 });
   const res = await run(env, 'INSERT INTO comments (request_id, user_id, body) VALUES (?, ?, ?)', id, user.id, body);
   await run(env, `UPDATE requests SET updated_at = datetime('now') WHERE id = ?`, id);
+  await syncIssue(env, id, url.origin, { commentOnly: true, comment: { text: commentText(user.name, body), deskCommentId: res.meta.last_row_id } });
   return json({ id: res.meta.last_row_id }, 201);
 });
 
 // ---- attachments
-route('POST', '/api/requests/:id/attachments', async ({ env, request, user, params }) => {
+route('POST', '/api/requests/:id/attachments', async ({ env, request, user, params, url }) => {
   const id = idParam(params.id);
   const r = await loadRequest(env, id);
   if (!isStaff(user) && r.requester_id !== user.id) throw new HttpError(403, 'Only the requester or the team can attach files');
@@ -434,6 +448,7 @@ route('POST', '/api/requests/:id/attachments', async ({ env, request, user, para
     id, key, name, type, data.byteLength, user.id);
   await logActivity(env, id, user.id, 'attachment', name);
   await run(env, `UPDATE requests SET updated_at = datetime('now') WHERE id = ?`, id);
+  if (r.github_issue_number) await syncIssue(env, id, url.origin); // refresh the attachment list in the issue body
   return json({ id: res.meta.last_row_id }, 201);
 });
 
@@ -471,6 +486,120 @@ route('GET', '/api/files/:id', async ({ env, request, params }) => {
   return new Response(obj.body, { headers });
 });
 
+// ---- GitHub integration (admin) ----------------------------------------------------------------
+route('GET', '/api/github/config', async ({ env, user }) => {
+  requireRole(user, 'admin');
+  return json({ enabled: githubEnabled(env), oauth: oauthEnabled(env) });
+});
+
+route('GET', '/api/github/connections', async ({ env, user }) => {
+  requireRole(user, 'admin');
+  const rows = await all(env, `SELECT c.id, c.label, c.kind, c.login, c.created_at,
+      (SELECT COUNT(*) FROM apps a WHERE a.github_connection_id = c.id) AS apps FROM github_connections c ORDER BY c.id`);
+  return json({ connections: rows });
+});
+
+route('POST', '/api/github/connections', async ({ env, request, user }) => {
+  requireRole(user, 'admin');
+  requireEnabled(env);
+  const body = await readJson(request);
+  const token = str(body.token, 'Token', { min: 10, max: 500 });
+  const label = str(body.label, 'Label', { max: 80 });
+  const made = await addConnection(env, { label: label || 'GitHub token', kind: 'token', token, userId: user.id });
+  return json(made, 201);
+});
+
+route('DELETE', '/api/github/connections/:id', async ({ env, user, params }) => {
+  requireRole(user, 'admin');
+  const id = idParam(params.id);
+  for (const app of await all(env, 'SELECT * FROM apps WHERE github_connection_id = ?', id)) await unlinkApp(env, app);
+  await run(env, 'DELETE FROM github_connections WHERE id = ?', id);
+  return json({ ok: true });
+});
+
+const stateCookie = (value, url, maxAge) =>
+  `gh_oauth_state=${value}; HttpOnly; SameSite=Lax; Path=/api/github/oauth; Max-Age=${maxAge}${url.protocol === 'https:' ? '; Secure' : ''}`;
+
+route('GET', '/api/github/oauth/start', async ({ env, url, user }) => {
+  requireRole(user, 'admin');
+  if (!oauthEnabled(env)) throw new HttpError(503, 'GitHub OAuth is not configured (set GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET)');
+  const state = randomToken(16);
+  const target = `${webBase(env)}/login/oauth/authorize?` + new URLSearchParams({
+    client_id: env.GITHUB_CLIENT_ID, redirect_uri: `${url.origin}/api/github/oauth/callback`, scope: 'repo', state,
+  });
+  return new Response(null, { status: 302, headers: { Location: target, 'Set-Cookie': stateCookie(state, url, 600), 'Cache-Control': 'no-store' } });
+});
+
+route('GET', '/api/github/oauth/callback', async ({ env, request, url, user }) => {
+  requireRole(user, 'admin');
+  const back = (kind, message) => new Response(null, {
+    status: 302,
+    headers: { Location: `/#/github?${kind}=${encodeURIComponent(message)}`, 'Set-Cookie': stateCookie('', url, 0), 'Cache-Control': 'no-store' },
+  });
+  const state = url.searchParams.get('state');
+  const saved = cookieValue(request, 'gh_oauth_state');
+  if (!state || !saved || state !== saved) return back('error', 'The GitHub sign-in expired or did not match. Please try again.');
+  const code = url.searchParams.get('code');
+  if (!code) return back('error', url.searchParams.get('error_description') || 'GitHub sign-in was cancelled.');
+  try {
+    const res = await fetch(`${webBase(env)}/login/oauth/access_token`, {
+      method: 'POST',
+      headers: { Accept: 'application/json', 'Content-Type': 'application/json', 'User-Agent': 'change-desk' },
+      body: JSON.stringify({ client_id: env.GITHUB_CLIENT_ID, client_secret: env.GITHUB_CLIENT_SECRET, code, redirect_uri: `${url.origin}/api/github/oauth/callback` }),
+      signal: AbortSignal.timeout(10000),
+    });
+    const data = await res.json();
+    if (!data.access_token) return back('error', data.error_description || 'GitHub did not return a token.');
+    const made = await addConnection(env, { label: 'GitHub OAuth', kind: 'oauth', token: data.access_token, userId: user.id });
+    return back('connected', `Connected as ${made.login}`);
+  } catch (e) {
+    return back('error', e.message || 'Could not complete GitHub sign-in.');
+  }
+});
+
+// Link / unlink an app's repository.
+route('PUT', '/api/apps/:id/github', async ({ env, request, url, user, params }) => {
+  requireRole(user, 'admin');
+  const app = await first(env, 'SELECT * FROM apps WHERE id = ?', idParam(params.id));
+  if (!app) throw new HttpError(404, 'App not found');
+  const body = await readJson(request);
+  const result = await linkApp(env, { app, connectionId: idParam(body.connection_id), repo: parseRepo(body.repo), origin: url.origin });
+  return json(result);
+});
+
+route('DELETE', '/api/apps/:id/github', async ({ env, user, params }) => {
+  requireRole(user, 'admin');
+  const app = await first(env, 'SELECT * FROM apps WHERE id = ?', idParam(params.id));
+  if (!app) throw new HttpError(404, 'App not found');
+  await unlinkApp(env, app);
+  return json({ ok: true });
+});
+
+// For manual webhook setup when the connection cannot create webhooks itself.
+route('GET', '/api/apps/:id/github/webhook', async ({ env, url, user, params }) => {
+  requireRole(user, 'admin');
+  requireEnabled(env);
+  const id = idParam(params.id);
+  if (!(await first(env, 'SELECT 1 FROM apps WHERE id = ?', id))) throw new HttpError(404, 'App not found');
+  return json({ url: webhookUrl(url.origin, id), secret: await webhookSecret(env, id), events: ['Issues', 'Issue comments'], content_type: 'application/json' });
+});
+
+// Create (or retry creating) the GitHub issue for one request.
+route('POST', '/api/requests/:id/github/sync', async ({ env, user, params, url }) => {
+  const id = idParam(params.id);
+  const r = await loadRequest(env, id);
+  if (!isStaff(user) && r.requester_id !== user.id) throw new HttpError(403, 'Only the requester or the team can do that');
+  requireEnabled(env);
+  const link = await first(env, `SELECT 1 FROM apps WHERE id = ? AND github_repo != '' AND github_connection_id IS NOT NULL`, r.app_id);
+  if (!link) throw new HttpError(400, 'This app is not linked to a GitHub repository');
+  await syncIssue(env, id, url.origin, { create: true, state: true });
+  const after = await loadRequest(env, id);
+  return json({ ok: !after.github_error, github_issue_url: after.github_issue_url, error: isStaff(user) ? after.github_error : undefined });
+});
+
+// GitHub -> desk. Authenticated by HMAC signature, not by session; GitHub cannot send our CSRF header.
+route('POST', '/api/github/webhook/:appId', async ({ env, request, params }) => json(await handleWebhook(env, request, idParam(params.appId))), { auth: false, csrf: false });
+
 // ---------------------------------------------------------------- dispatcher
 
 export async function handleApi(request, env, ctx) {
@@ -479,15 +608,15 @@ export async function handleApi(request, env, ctx) {
     const method = request.method === 'HEAD' ? 'GET' : request.method;
     let matched = null;
     let pathMatched = false;
-    for (const [m, regex, handler, auth] of routes) {
+    for (const [m, regex, handler, auth, csrf] of routes) {
       const hit = regex.exec(url.pathname);
       if (!hit) continue;
       pathMatched = true;
-      if (m === method) { matched = { handler, auth, params: hit.groups || {} }; break; }
+      if (m === method) { matched = { handler, auth, csrf, params: hit.groups || {} }; break; }
     }
     if (!matched) throw new HttpError(pathMatched ? 405 : 404, pathMatched ? 'Method not allowed' : 'Not found');
 
-    if (method !== 'GET') {
+    if (method !== 'GET' && matched.csrf) {
       // CSRF defence in depth: custom header (forces a CORS preflight) + same-origin check.
       if (request.headers.get('X-Requested-With') !== CSRF_HEADER) throw new HttpError(403, 'Missing request header');
       const origin = request.headers.get('Origin');

@@ -75,3 +75,8 @@ export function csvCell(value) {
   if (/^[=+\-@\t\r]/.test(s)) s = `'${s}`;
   return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
 }
+
+// ---- tiny D1 helpers shared by the API and the GitHub sync code
+export const first = (env, sql, ...args) => env.DB.prepare(sql).bind(...args).first();
+export const all = async (env, sql, ...args) => (await env.DB.prepare(sql).bind(...args).all()).results;
+export const run = (env, sql, ...args) => env.DB.prepare(sql).bind(...args).run();

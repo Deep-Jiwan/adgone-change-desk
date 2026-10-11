@@ -6,7 +6,7 @@ const CATEGORY = { bug: 'Bug Fix', feature: 'New Feature', improvement: 'Improve
 const PRIORITY = { low: 'Low', medium: 'Medium', high: 'High', critical: 'Critical' };
 const ROLE = { admin: 'Admin', developer: 'Developer', requester: 'Requester' };
 const APP_STATUS = { active: 'Active', maintenance: 'Maintenance', retired: 'Retired' };
-const ACTION_TEXT = { created: 'created the request', status: 'changed status', assigned: 'assigned to', due: 'set due date', priority: 'changed priority', category: 'changed category', progress: 'set progress', edited: 'edited', attachment: 'attached' };
+const ACTION_TEXT = { github: '', created: 'created the request', status: 'changed status', assigned: 'assigned to', due: 'set due date', priority: 'changed priority', category: 'changed category', progress: 'set progress', edited: 'edited', attachment: 'attached' };
 const NEXT_LABEL = { review: 'Start review', approved: 'Approve', in_progress: 'Start work', testing: 'Ready for testing', completed: 'Accept & complete', rejected: 'Reject', new: 'Reopen' };
 
 /* ------------------------------------------------------------ helpers */
@@ -89,7 +89,8 @@ function layout(active, ...content) {
   const nav = h('nav', { class: 'nav' },
     link('/', 'Dashboard', 'dashboard'),
     link('/requests', 'All requests', 'requests'),
-    state.user.role === 'admin' && link('/team', 'Team', 'team'));
+    state.user.role === 'admin' && link('/team', 'Team', 'team'),
+    state.user.role === 'admin' && link('/github', 'GitHub', 'github'));
   const me = h('div', { class: 'me small' },
     h('div', {}, h('b', {}, state.user.name)),
     h('div', { class: 'muted' }, ROLE[state.user.role]),
@@ -178,6 +179,51 @@ function appCard(a) {
     h('div', { class: 'counts' }, stat(a.pending, 'Pending'), stat(a.in_progress, 'In progress'), stat(a.completed, 'Done'), stat(a.overdue, 'Overdue', true)));
 }
 
+function githubSection(app) {
+  const body = h('div', { class: 'stack' }, h('span', { class: 'muted small' }, 'Loading…'));
+  const box = h('div', { class: 'stack', style: 'border-top:1px solid var(--border);padding-top:1rem' },
+    h('h3', {}, 'GitHub repository'),
+    h('p', { class: 'muted small', style: 'margin:0' }, 'Tickets created in Change Desk for this app are also created as issues in the linked repository. Closing an issue or commenting on it updates the ticket here. Issues created directly on GitHub are never imported.'),
+    body);
+  (async () => {
+    try {
+      const cfg = await api('GET', '/api/github/config');
+      if (!cfg.enabled) return body.replaceChildren(h('div', { class: 'error' }, 'GitHub integration is switched off on the server. Set the ENCRYPTION_KEY secret to enable it (see the README).'));
+      const { connections } = await api('GET', '/api/github/connections');
+      const draw = (result) => {
+        const err = errorBox();
+        const conn = h('select', { 'aria-label': 'GitHub connection' }, connections.map((c) => h('option', { value: c.id, selected: c.id === app.github_connection_id }, `${c.label} (@${c.login})`)));
+        const repo = h('input', { value: app.github_repo || '', placeholder: 'owner/name or https://github.com/owner/name', 'aria-label': 'Repository' });
+        const link = h('button', { class: 'primary', type: 'button', onclick: async () => {
+          err.classList.add('hidden'); link.disabled = true;
+          try {
+            const res = await api('PUT', `/api/apps/${app.id}/github`, { connection_id: Number(conn.value), repo: repo.value });
+            app.github_repo = res.repo; app.github_connection_id = Number(conn.value);
+            draw(res);
+          } catch (e) { showError(err, e); link.disabled = false; }
+        } }, app.github_repo ? 'Update link' : 'Link repository');
+        const parts = [];
+        if (app.github_repo) parts.push(h('div', { class: 'notice' }, '🔗 Linked to ', h('b', {}, app.github_repo)));
+        if (result?.webhook === 'created') parts.push(h('div', { class: 'notice' }, 'Webhook created on GitHub, so closes and comments flow back automatically.'));
+        if (result?.webhook === 'manual') {
+          parts.push(h('div', { class: 'error' }, h('b', {}, 'Linked, but the webhook was not created. '), 'This connection cannot manage webhooks, so GitHub → Change Desk updates will not arrive until you add one. In the repository go to Settings → Webhooks → Add webhook:',
+            h('ul', {}, h('li', {}, 'Payload URL: ', h('code', { class: 'pw' }, result.webhook_url)), h('li', {}, 'Content type: ', h('code', {}, 'application/json')), h('li', {}, 'Secret: ', h('code', { class: 'pw' }, result.webhook_secret)), h('li', {}, 'Events: Issues and Issue comments'))));
+        }
+        parts.push(err);
+        if (!connections.length) parts.push(h('p', {}, 'Add a GitHub connection first: ', h('a', { href: '#/github', onclick: () => document.querySelector('.modal')?.remove() }, 'GitHub settings →')));
+        else parts.push(h('label', {}, 'Connection', conn), h('label', {}, 'Repository', repo), h('div', { class: 'row' }, link,
+          app.github_repo && h('button', { type: 'button', class: 'danger', onclick: async () => {
+            if (!confirm('Unlink this repository? Existing issues stay on GitHub but stop syncing.')) return;
+            try { await api('DELETE', `/api/apps/${app.id}/github`); app.github_repo = ''; app.github_connection_id = null; draw(); } catch (e) { showError(err, e); }
+          } }, 'Unlink')));
+        body.replaceChildren(...parts);
+      };
+      draw();
+    } catch (e) { body.replaceChildren(h('div', { class: 'error' }, e.message)); }
+  })();
+  return box;
+}
+
 function modal(title, body, onClose) {
   const close = () => { overlay.remove(); onClose?.(); };
   const overlay = h('div', { class: 'modal', role: 'dialog', 'aria-modal': 'true', 'aria-label': title, onclick: (e) => { if (e.target === overlay) close(); } },
@@ -212,7 +258,7 @@ function appModal(app) {
   h('div', { class: 'form-grid' }, h('label', {}, 'Name', name), h('label', {}, 'Key', h('span', { class: 'hint' }, 'Used in request IDs (CHAI-0001)'), key), h('label', {}, 'Icon', icon), h('label', {}, 'Version', version), h('label', {}, 'Status', status)),
   h('label', {}, 'Repository URL', repo), h('label', {}, 'Description', description),
   h('button', { class: 'primary', type: 'submit' }, app ? 'Save changes' : 'Add app'));
-  const close = modal(app ? 'Edit app' : 'Add app', form);
+  const close = modal(app ? 'Edit app' : 'Add app', app ? h('div', { class: 'stack' }, form, githubSection(app)) : form, () => route());
   name.focus();
 }
 
@@ -286,6 +332,7 @@ async function appView(id) {
           state.user.role === 'admin' && h('button', { onclick: () => appModal(app) }, 'Edit'),
           app.status !== 'retired' && h('a', { class: 'btn primary', href: `#/app/${app.id}/new` }, '+ Request change'))),
       app.description && h('p', { class: 'muted', style: 'margin:0' }, app.description),
+      app.github_repo && h('div', { class: 'small' }, '🔗 Synced with GitHub: ', h('a', { href: `https://github.com/${app.github_repo}`, target: '_blank', rel: 'noopener noreferrer' }, app.github_repo)),
       h('div', { class: 'counts' }, stat(app.pending, 'Pending'), stat(app.in_progress, 'In progress'), stat(app.completed, 'Completed'), stat(app.overdue, 'Overdue', true))),
     h('h2', {}, 'Change history'), list);
   await requestList(list, { app: app.id }, { exportable: true });
@@ -432,6 +479,7 @@ async function newRequestView(appId) {
   h('div', { class: 'form-grid' }, h('label', {}, 'Category', category), h('label', {}, 'Priority', priority)),
   h('label', {}, 'Description', description),
   h('div', { class: 'stack', style: 'gap:.4rem' }, h('b', {}, 'Screenshots & files'), picker.el),
+  app.github_repo && h('p', { class: 'muted small', style: 'margin:0' }, `This request will also be created as an issue in ${app.github_repo} on GitHub.`),
   h('div', { class: 'row' }, submit, h('a', { class: 'btn', href: `#/app/${app.id}` }, 'Cancel')));
   layout('dashboard',
     h('div', { class: 'crumbs small' }, h('a', { href: '#/' }, 'Applications'), ' / ', h('a', { href: `#/app/${app.id}` }, app.name), ' / New request'),
@@ -521,12 +569,34 @@ async function requestView(id) {
         h('div', { class: 'card stack' }, h('h2', {}, 'Description'), r.description ? h('div', { class: 'prose' }, r.description) : h('div', { class: 'muted' }, 'No description provided.')),
         h('div', { class: 'card stack' }, h('h2', {}, `Screenshots & files (${attachments.length})`), attachments.length ? gallery : h('div', { class: 'muted' }, 'Nothing attached yet.'), adder),
         h('div', { class: 'card stack' }, h('h2', {}, `Discussion (${comments.length})`),
-          comments.length ? h('div', {}, comments.map((c) => h('div', { class: 'comment' }, h('div', {}, h('span', { class: 'who' }, c.user_name), ' ', badge('', ROLE[c.user_role]), ' ', h('span', { class: 'muted small' }, fmtDateTime(c.created_at))), h('div', { class: 'prose' }, c.body)))) : h('div', { class: 'muted' }, 'No comments yet.'),
+          comments.length ? h('div', {}, comments.map((c) => h('div', { class: 'comment' }, h('div', {}, h('span', { class: 'who' }, c.user_name), ' ', badge('', c.source === 'github' ? 'GitHub' : ROLE[c.user_role]), ' ', h('span', { class: 'muted small' }, fmtDateTime(c.created_at))), h('div', { class: 'prose' }, c.body)))) : h('div', { class: 'muted' }, 'No comments yet.'),
           commentBox, h('div', {}, post))),
       h('div', { class: 'stack' },
         h('div', { class: 'card' }, meta),
+        githubBox(r, perm, reload),
         h('div', { class: 'card stack' }, h('h2', {}, 'Activity'),
-          h('ul', { class: 'log' }, activity.map((a) => h('li', {}, h('b', {}, a.user_name || 'System'), ' ', ACTION_TEXT[a.action] || a.action, a.detail && `: ${a.detail}`, h('div', { class: 'muted small' }, fmtDateTime(a.created_at)))))))));
+          h('ul', { class: 'log' }, activity.map((a) => h('li', {}, h('b', {}, a.user_name || 'GitHub'), ' ', a.action === 'github' ? a.detail : [ACTION_TEXT[a.action] || a.action, a.detail && `: ${a.detail}`], h('div', { class: 'muted small' }, fmtDateTime(a.created_at)))))))));
+}
+
+function githubBox(r, perm, reload) {
+  if (!r.github_issue_number && !r.github_error && !r.app_github_repo) return null;
+  const parts = [h('h2', {}, 'GitHub')];
+  if (r.github_issue_number) {
+    parts.push(h('div', {}, h('a', { href: r.github_issue_url, target: '_blank', rel: 'noopener noreferrer' }, `${r.github_repo}#${r.github_issue_number} ↗`)),
+      h('div', { class: 'muted small' }, 'Comments, status and closing stay in step with this ticket.'));
+  } else {
+    parts.push(h('div', { class: 'muted small' }, 'This request has no GitHub issue yet.'));
+  }
+  if (r.github_error) parts.push(h('div', { class: 'error small' }, r.github_error));
+  if ((!r.github_issue_number || r.github_error) && perm.attach && r.app_github_repo) {
+    const btn = h('button', { onclick: async () => {
+      btn.disabled = true;
+      try { const res = await api('POST', `/api/requests/${r.id}/github/sync`); toast(res.ok ? 'Synced with GitHub' : (res.error || 'Could not sync'), res.ok); await reload(); }
+      catch (e) { toast(e.message, false); btn.disabled = false; }
+    } }, r.github_issue_number ? 'Retry sync' : 'Create GitHub issue');
+    parts.push(h('div', {}, btn));
+  }
+  return h('div', { class: 'card stack' }, parts);
 }
 
 function noteModal(title, onSubmit) {
@@ -546,6 +616,48 @@ function editModal(r, patch) {
     h('label', {}, 'Title', title), h('div', { class: 'form-grid' }, h('label', {}, 'Category', category), h('label', {}, 'Priority', priority)),
     h('label', {}, 'Description', description), h('button', { class: 'primary', type: 'submit' }, 'Save'));
   const close = modal('Edit request', form);
+}
+
+/* ------------------------------------------------------------ github settings */
+
+async function githubView(query) {
+  if (state.user.role !== 'admin') return go('/');
+  const [cfg, { connections }] = await Promise.all([api('GET', '/api/github/config'), api('GET', '/api/github/connections')]);
+  const err = errorBox();
+  const label = h('input', { placeholder: 'e.g. Acme org bot', maxLength: 80 });
+  const token = h('input', { type: 'password', required: true, autocomplete: 'off', placeholder: 'github_pat_… or ghp_…' });
+  const add = h('form', {
+    class: 'card stack',
+    async onsubmit(e) {
+      e.preventDefault();
+      try { await api('POST', '/api/github/connections', { label: label.value, token: token.value }); toast('Connection added'); route(); }
+      catch (ex) { showError(err, ex); }
+    },
+  }, h('h2', {}, 'Connect with a token'),
+  h('p', { class: 'muted small', style: 'margin:0' }, 'Create a ', h('a', { href: 'https://github.com/settings/personal-access-tokens/new', target: '_blank', rel: 'noopener noreferrer' }, 'fine-grained personal access token'),
+    ', limited to the repositories you want to link, with Repository permissions: ', h('b', {}, 'Issues: Read and write'), ' and ', h('b', {}, 'Webhooks: Read and write'), ' (lets Change Desk set up GitHub → Change Desk updates for you). Metadata (read) is added automatically.'),
+  err, h('div', { class: 'form-grid' }, h('label', {}, 'Label', label), h('label', {}, 'Token', token)),
+  h('div', {}, h('button', { class: 'primary', type: 'submit' }, 'Verify & save')));
+
+  const oauth = cfg.oauth && h('div', { class: 'card stack' }, h('h2', {}, 'Connect with GitHub (OAuth)'),
+    h('p', { class: 'muted small', style: 'margin:0' }, 'Sign in with GitHub and approve access. Note that OAuth grants access to every repository your account can reach; a token limited to specific repositories is tighter.'),
+    h('div', {}, h('button', { class: 'primary', onclick: () => { location.href = '/api/github/oauth/start'; } }, 'Connect with GitHub')));
+
+  layout('github',
+    h('h1', {}, 'GitHub'),
+    h('p', { class: 'muted', style: 'margin:0' }, 'Link each app to a GitHub repository (open an app → Edit → GitHub repository). Tickets created here become GitHub issues; closing or commenting on those issues updates the ticket. Issues that start on GitHub are never imported.'),
+    query.connected && h('div', { class: 'notice' }, query.connected),
+    query.error && h('div', { class: 'error' }, query.error),
+    !cfg.enabled && h('div', { class: 'error' }, h('b', {}, 'Not enabled. '), 'Set an encryption secret on the Worker, then reload: ', h('code', {}, 'npx wrangler secret put ENCRYPTION_KEY'), ' (any random string of 16+ characters; keep it safe, changing it invalidates saved connections).'),
+    cfg.enabled && h('div', { class: 'card table-wrap' }, connections.length
+      ? h('table', {}, h('thead', {}, h('tr', {}, ['Label', 'Type', 'GitHub user', 'Apps using it', 'Added', ''].map((t) => h('th', {}, t)))),
+        h('tbody', {}, connections.map((c) => h('tr', {}, h('td', {}, c.label), h('td', {}, c.kind === 'oauth' ? 'OAuth' : 'Token'), h('td', {}, '@' + c.login), h('td', {}, c.apps), h('td', {}, fmtDate(c.created_at.slice(0, 10))),
+          h('td', {}, h('button', { class: 'danger', onclick: async () => {
+            if (!confirm(`Remove "${c.label}"?${c.apps ? ` ${c.apps} linked app(s) will be unlinked and their GitHub webhooks removed.` : ''}`)) return;
+            try { await api('DELETE', `/api/github/connections/${c.id}`); route(); } catch (ex) { toast(ex.message, false); }
+          } }, 'Remove'))))))
+      : h('div', { class: 'empty' }, 'No GitHub connections yet.')),
+    cfg.enabled && add, cfg.enabled && oauth);
 }
 
 /* ------------------------------------------------------------ team + account */
@@ -617,7 +729,8 @@ function handleError(e) {
 async function route() {
   state.cleanups.splice(0).forEach((fn) => fn());
   document.querySelectorAll('.modal').forEach((m) => m.remove());
-  const path = location.hash.replace(/^#/, '') || '/';
+  const [path, qs] = (location.hash.replace(/^#/, '') || '/').split('?');
+  const query = Object.fromEntries(new URLSearchParams(qs || ''));
   try {
     if (!state.user) {
       try { state.user = (await api('GET', '/api/me')).user; } catch { /* not signed in */ }
@@ -629,6 +742,7 @@ async function route() {
     if (path === '/') await dashboardView();
     else if (path === '/requests') await allRequestsView();
     else if (path === '/team') await teamView();
+    else if (path === '/github') await githubView(query);
     else if (path === '/account') accountView();
     else if ((m = path.match(/^\/app\/(\d+)\/new$/))) await newRequestView(m[1]);
     else if ((m = path.match(/^\/app\/(\d+)$/))) await appView(m[1]);

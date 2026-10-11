@@ -56,7 +56,7 @@ export function sessionCookie(token, url, maxAge = SESSION_DAYS * 86400) {
   return `sid=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${maxAge}${secure}`;
 }
 
-function cookieValue(request, name) {
+export function cookieValue(request, name) {
   const header = request.headers.get('Cookie') || '';
   for (const part of header.split(';')) {
     const [k, ...rest] = part.trim().split('=');
