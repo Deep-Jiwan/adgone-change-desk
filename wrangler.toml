@@ -1,0 +1,20 @@
+name = "change-desk"
+main = "src/index.js"
+compatibility_date = "2025-01-01"
+
+# Static frontend. API requests (/api/*) go to the Worker first.
+[assets]
+directory = "./public"
+binding = "ASSETS"
+run_worker_first = ["/api/*"]
+not_found_handling = "single-page-application"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "change-desk"
+# Replace with the id printed by `npx wrangler d1 create change-desk`
+database_id = "REPLACE_WITH_D1_DATABASE_ID"
+
+[[r2_buckets]]
+binding = "FILES"
+bucket_name = "change-desk-files"
