@@ -47,6 +47,20 @@ Open the deployed URL. **The first account created becomes the admin.** Then add
 team (*Team* → *Invite a teammate*). Invited people get a one-time temporary password you pass on to them; they must change it
 on first sign-in.
 
+## Automatic deployment (GitHub Actions)
+
+`.github/workflows/deploy.yml` tests, migrates the database and deploys on every push to `main`. One-time setup:
+
+1. Do the **Deploy** steps above once by hand (creates the D1 database and R2 bucket) and commit the real `database_id` in `wrangler.toml`.
+2. In Cloudflare: *My Profile → API Tokens → Create Token → "Edit Cloudflare Workers"* template, then add the permission
+   **Account → D1 → Edit**. Copy your **Account ID** from the dashboard sidebar.
+3. In GitHub: *Settings → Secrets and variables → Actions* → add `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID`.
+
+Until steps 1 and 3 are done the workflow skips the deploy and finishes green.
+
+Alternative: Cloudflare's own Git integration (*Workers & Pages → Create → Import a repository*, build command empty,
+deploy command `npx wrangler deploy`) does the same without secrets in GitHub, but you set it up in the Cloudflare dashboard.
+
 ## Local development
 
 ```bash
