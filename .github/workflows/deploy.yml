@@ -1,8 +1,8 @@
-name: Deploy to Cloudflare
+name: Deploy to Cloudflare (manual)
 
+# Manual only: nothing deploys to the cloud unless you press "Run workflow".
+# To deploy on every push to main again, add:  push: { branches: [main] }
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
 
 concurrency:

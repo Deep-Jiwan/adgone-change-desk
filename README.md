@@ -4,6 +4,28 @@ A change-management dashboard for your apps. Open it, see every app, pick one, a
 pasting a screenshot. Built on Cloudflare: **Workers** (API + static frontend), **D1** (database) and **R2** (screenshots/files).
 No framework, no build step.
 
+## Run it on your own PC
+
+No Cloudflare account, no cloud services. Data is stored in a folder on your computer.
+
+```bash
+git clone https://github.com/Deep-Jiwan/adgone-change-desk.git   # or unzip the zip you were given
+cd adgone-change-desk
+npm install                # needs Node 20 or newer (https://nodejs.org)
+npm start                  # creates the local database on first run, then serves http://localhost:8787
+```
+
+Open **http://localhost:8787**. The first account you create becomes the admin. Press `Ctrl+C` to stop; start it again with `npm start`.
+
+- **Where your data lives:** the `.wrangler/state/` folder inside the project (the database and every uploaded screenshot).
+  Back that folder up to back up everything. Delete it to start from scratch.
+- **Let teammates on your network use it:** run `npm run start:lan` and share `http://<your-pc-ip>:8787`.
+  It is plain HTTP, so only do this on a network you trust, and keep your PC awake and the terminal open while they work.
+- **GitHub sync (optional):** copy `.dev.vars.example` to `.dev.vars` and set `ENCRYPTION_KEY`. GitHub can only send
+  closes/comments back to a publicly reachable address, so GitHub → Change Desk updates need a tunnel (for example Cloudflare Tunnel or ngrok)
+  pointing at port 8787. Desk → GitHub works without one.
+- **Updating:** `git pull`, `npm install`, `npm start`. New database migrations apply automatically on start.
+
 ## What's in version 1
 
 - **Dashboard** of all apps with pending / in-progress / completed / overdue counts, search and status filter.
@@ -26,9 +48,9 @@ No framework, no build step.
 
 Not in v1 yet: @mentions, email/push notifications, linked/duplicate requests, release history, PDF export.
 
-## Deploy
+## Deploy to Cloudflare (optional)
 
-Requires a Cloudflare account and Node 20+.
+Not needed to run on your own PC (see above). Requires a Cloudflare account and Node 20+.
 
 ```bash
 npm install
@@ -45,7 +67,7 @@ npm run db:migrate:remote
 npm run deploy
 ```
 
-The Worker is served at **https://changedesk.adgone.co.tz** (configured in `wrangler.toml`). This needs the `adgone.co.tz` zone to be on the
+To serve it at **https://changedesk.adgone.co.tz**, uncomment the `routes` line in `wrangler.toml`. This needs the `adgone.co.tz` zone to be on the
 same Cloudflare account; Cloudflare then creates the DNS record and certificate on the first deploy. If the zone lives elsewhere, delete the
 `routes` line in `wrangler.toml` to use the free `*.workers.dev` address instead, or move the domain's nameservers to Cloudflare.
 If you use GitHub OAuth, set its callback URL to `https://changedesk.adgone.co.tz/api/github/oauth/callback`.
@@ -99,9 +121,10 @@ Good to know:
 - `@mentions` in desk text are neutralised before posting, so desk users cannot ping GitHub accounts.
 - GitHub Enterprise: set the `GITHUB_API_URL` and `GITHUB_WEB_URL` variables (e.g. `https://ghe.example.com/api/v3`).
 
-## Automatic deployment (GitHub Actions)
+## Automatic deployment (GitHub Actions, optional)
 
-`.github/workflows/deploy.yml` tests, migrates the database and deploys on every push to `main`. One-time setup:
+`.github/workflows/deploy.yml` tests, migrates the database and deploys to Cloudflare. It is **manual-only** (Actions → *Deploy to Cloudflare (manual)* → Run workflow);
+add a `push:` trigger to deploy on every push to `main`. One-time setup:
 
 1. Do the **Deploy** steps above once by hand (creates the D1 database and R2 bucket) and commit the real `database_id` in `wrangler.toml`.
 2. In Cloudflare: *My Profile → API Tokens → Create Token → "Edit Cloudflare Workers"* template, then add the permission

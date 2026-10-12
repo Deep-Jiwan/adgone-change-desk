@@ -1,0 +1,9 @@
+# Copy this file to .dev.vars (it is git-ignored). Only needed for the optional GitHub sync.
+
+# Any random string of 16+ characters. Encrypts saved GitHub tokens: keep it safe and do not change it later,
+# or saved GitHub connections stop working.
+ENCRYPTION_KEY=change-me-to-a-long-random-string
+
+# Only if you want "Connect with GitHub" (OAuth). Callback URL to register: http://localhost:8787/api/github/oauth/callback
+# GITHUB_CLIENT_ID=
+# GITHUB_CLIENT_SECRET=
